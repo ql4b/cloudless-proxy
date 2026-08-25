@@ -1,0 +1,14 @@
+# Environment (contains real AWS profile/region)
+.env
+
+# Terraform
+infra/.terraform/
+infra/.external_modules/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/.terraform.lock.hcl
+*.tfvars
+*.tfvars.json
+
+# OS
+.DS_Store

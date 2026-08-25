@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -euo pipefail
+
+REGION="${AWS_REGION:-eu-central-1}"
+PROFILE="${AWS_PROFILE:-ql4b}"
+PORT="${PROXY_PORT:-8888}"
+
+_no_proxy() {
+  unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+}
+
+_instance() {
+  _no_proxy
+  aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=cloudless-proxy" \
+              "Name=instance-state-name,Values=running,pending" \
+    --query "Reservations[0].Instances[0].[InstanceId,PublicIpAddress,State.Name]" \
+    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+}
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  status)
+    read -r id ip state <<< "$(_instance)"
+    if [[ -z "$id" || "$id" == "None" ]]; then
+      echo "no instance running"
+    else
+      echo "id:    $id"
+      echo "ip:    $ip"
+      echo "state: $state"
+      echo "url:   http://$ip:$PORT"
+      echo "region: $REGION"
+    fi
+    ;;
+
+  up)
+    _no_proxy
+    tf apply -auto-approve
+    read -r id ip state <<< "$(_instance)"
+    echo "HTTP_PROXY=http://$ip:$PORT"
+    ;;
+
+  down)
+    _no_proxy
+    tf destroy -auto-approve
+    ;;
+
+  recreate)
+    _no_proxy
+    read -r id _ _ <<< "$(_instance)"
+    if [[ -n "$id" && "$id" != "None" ]]; then
+      aws ec2 terminate-instances --instance-ids "$id" \
+        --profile "$PROFILE" --region "$REGION" > /dev/null
+      echo "terminated $id, waiting..."
+      aws ec2 wait instance-terminated --instance-ids "$id" \
+        --profile "$PROFILE" --region "$REGION"
+    fi
+    tf apply -auto-approve
+    read -r id ip state <<< "$(_instance)"
+    echo "HTTP_PROXY=http://$ip:$PORT"
+    ;;
+
+  test)
+    read -r _ ip _ <<< "$(_instance)"
+    [[ -z "$ip" || "$ip" == "None" ]] && { echo "no instance running"; exit 1; }
+    curl -s --proxy "http://$ip:$PORT" -o /dev/null -w "%{http_code} via $ip\n" https://cloudless.sh
+    ;;
+
+  env)
+    read -r _ ip _ <<< "$(_instance)"
+    [[ -z "$ip" || "$ip" == "None" ]] && { echo "no instance running"; exit 1; }
+    echo "export HTTP_PROXY=http://$ip:$PORT"
+    echo "export HTTPS_PROXY=http://$ip:$PORT"
+    echo "export http_proxy=http://$ip:$PORT"
+    echo "export https_proxy=http://$ip:$PORT"
+    echo "export PROXY=http://$ip:$PORT"
+    ;;
+
+  *)
+    echo "usage: proxy <status|up|down|recreate|test|env>"
+    echo "       eval \$(proxy env)   # export proxy vars"
+    ;;
+esac

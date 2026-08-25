@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -a
+# shellcheck source=/dev/null
+source .env && \
+PATH="$(pwd)/bin:$(pwd):$PATH"
+set +a
