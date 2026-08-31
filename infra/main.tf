@@ -7,10 +7,8 @@ module "label" {
 }
 
 module "proxy" {
-  # After the next release, switch to the registry source:
-  # source  = "ql4b/ec2-proxy/aws"
-  # version = "~> 2.5"
-  source = "git@github.com:ql4b/terraform-aws-ec2-proxy.git?ref=feat/optional-vpc-subnet"
+  source  = "ql4b/ec2-proxy/aws"
+  version = "~> 2.5"
 
   context       = module.label.context
   allowed_cidrs = var.allowed_cidrs
