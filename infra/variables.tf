@@ -38,3 +38,13 @@ variable "ttl_hours" {
   type    = number
   default = null
 }
+
+variable "vpc_id" {
+  type    = string
+  default = null
+}
+
+variable "subnet_id" {
+  type    = string
+  default = null
+}

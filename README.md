@@ -20,7 +20,7 @@ curl http://httpbin.org/ip   # shows the proxy's IP
 
 - Terraform >= 1.12 installed (path configured in `.env` via `TERRAFORM_BIN`)
 - AWS credentials configured (profile, env vars, or IAM role)
-- AWS account with a default VPC
+- AWS account with a default VPC (or provide `TF_VAR_vpc_id` and `TF_VAR_subnet_id` for a custom VPC)
 
 ## Commands
 
@@ -73,6 +73,8 @@ TF_VAR_spot=false            # use on-demand instead of spot
 TF_VAR_ttl_hours=2           # auto-terminate after 2 hours
 TF_VAR_instance_type=t4g.micro  # larger instance if needed
 TF_VAR_allowed_cidrs='["203.0.113.0/24"]'  # explicit CIDRs (default: auto-detect your IP)
+TF_VAR_vpc_id=vpc-abc123     # deploy into a specific VPC (default: region's default VPC)
+TF_VAR_subnet_id=subnet-def456  # deploy into a specific public subnet
 ```
 
 ## Region Switching
@@ -114,6 +116,67 @@ cloudless-proxy/
 ## Cost
 
 ~$0.0016/hour for `t4g.nano` spot in `us-east-1`. Typical usage (deploy for an hour, destroy) costs less than a cent.
+
+## Shell Integration
+
+Add these to your `~/.zshrc` (or `~/.bashrc`) to use the proxy from any directory without needing to `cd` or `source activate` manually:
+
+```bash
+CLOUDLESS_PROXY_PATH="$HOME/code/cloudless-proxy"  # adjust to your clone path
+
+proxy_up() {
+  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy up)
+}
+
+proxy_down() {
+  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy down)
+}
+
+proxy_recreate() {
+  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy recreate)
+}
+
+proxy_status() {
+  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy status)
+}
+
+proxy_env() {
+  cd "$CLOUDLESS_PROXY_PATH" && source ./activate && eval "$(proxy env)" && cd "$OLDPWD"
+}
+```
+
+Then from any terminal:
+
+```bash
+proxy_up                  # deploy
+proxy_env                 # export HTTP_PROXY into current shell
+curl http://httpbin.org/ip
+proxy_down                # destroy
+```
+
+### MITM inspection
+
+Chain with [mitmproxy](https://mitmproxy.org/) to inspect HTTPS traffic through the cloud proxy:
+
+```bash
+proxy_mitm() {
+  local port="${1:-8080}"
+  shift 2>/dev/null
+  proxy_env
+  mitmproxy \
+      --mode upstream:$HTTP_PROXY \
+      --listen-host 127.0.0.1 \
+      --listen-port "$port" \
+      --ssl-insecure \
+      "$@"
+}
+```
+
+```bash
+proxy_up
+proxy_mitm         # starts mitmproxy on localhost:8080, upstream through cloud proxy
+# point browser or curl at http://127.0.0.1:8080
+```
 
 ## License
 
