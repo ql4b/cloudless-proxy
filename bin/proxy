@@ -204,13 +204,26 @@ case "$cmd" in
     ;;
 
   up)
-    # Create the ASG scaffolding. With wait_for_capacity_timeout=0 the apply
-    # returns before the instance is up, so poll for it rather than reading once.
+    # Provision the ASG scaffolding, then ensure it is scaled up.
+    #
+    # apply alone is NOT enough on a re-run: desired_capacity is in the module's
+    # ignore_changes, so once the ASG exists a `tf apply` won't reset desired to
+    # 1. After `proxy scale-down`, `proxy up` would otherwise apply (no changes)
+    # and then wait forever for an instance that nothing asked for. So if the
+    # ASG is already at 0, we scale it up ourselves (with a warning) rather than
+    # hang — `up` should always leave you with a running proxy.
     _guard_region
     _no_proxy
-    echo "→ applying Terraform (creating ASG + launch template)..." >&2
+    echo "→ applying Terraform (creating/updating ASG + launch template)..." >&2
     tf apply -auto-approve
-    echo "→ apply complete; ASG created" >&2
+    echo "→ apply complete" >&2
+
+    desired="$(_asg_desired)"
+    if [[ "$desired" == "0" ]]; then
+      echo "! ASG already existed at desired 0 — scaling up (this is really 'proxy scale-up')" >&2
+      _set_desired 1
+      echo "→ scaled $ASG_NAME to 1" >&2
+    fi
     "$0" wait
     ;;
 
