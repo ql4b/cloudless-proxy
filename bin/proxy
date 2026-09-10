@@ -41,6 +41,26 @@ _set_desired() {
     --profile "$PROFILE" --region "$REGION"
 }
 
+# Read the proxy:ttl-hours tag off an instance (empty if unset / always-on).
+# The module stamps this tag only when ttl_hours is set, so absence == no TTL.
+_instance_ttl() {
+  local id="$1"
+  [[ -z "$id" || "$id" == "None" ]] && return 0
+  aws ec2 describe-instances --instance-ids "$id" \
+    --query "Reservations[0].Instances[0].Tags[?Key=='proxy:ttl-hours'].Value | [0]" \
+    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+}
+
+# Human-readable TTL line: "2h (self-terminates)" or "none (always-on)".
+_ttl_label() {
+  local ttl="$1"
+  if [[ -n "$ttl" && "$ttl" != "None" ]]; then
+    echo "${ttl}h (self-terminates, then scales to zero)"
+  else
+    echo "none (always-on)"
+  fi
+}
+
 # Region recorded in Terraform state (empty if no state / no resources yet).
 # AWS provider v6 pins each resource to the region it was created in, so a
 # region switch via AWS_REGION would strand the old region's resources and
@@ -52,7 +72,9 @@ _STATE="$_ROOT/infra/terraform.tfstate"
 
 _state_region() {
   [[ -f "$_STATE" ]] || return 0
-  grep -oE '"region": "[a-z0-9-]+"' "$_STATE" 2>/dev/null \
+  # `|| true` so a no-match grep (exit 1) doesn't trip set -e / pipefail and
+  # abort the caller — an empty result is the normal "nothing deployed" case.
+  { grep -oE '"region": "[a-z0-9-]+"' "$_STATE" 2>/dev/null || true; } \
     | head -1 | sed -E 's/.*"([a-z0-9-]+)"$/\1/'
 }
 
@@ -87,15 +109,20 @@ case "$cmd" in
   status)
     read -r id ip state <<< "$(_instance)"
     desired="$(_asg_desired)"
+    echo "region: $REGION"
     if [[ -z "$id" || "$id" == "None" ]]; then
-      echo "no instance running (ASG $ASG_NAME desired: ${desired:-unknown})"
+      if [[ -z "$desired" || "$desired" == "None" ]]; then
+        echo "asg:    $ASG_NAME (not deployed — run 'proxy up')"
+      else
+        echo "asg:    $ASG_NAME (desired: $desired — no instance running)"
+      fi
     else
       echo "id:     $id"
       echo "ip:     $ip"
       echo "state:  $state"
       echo "url:    http://$ip:$PORT"
-      echo "region: $REGION"
       echo "asg:    $ASG_NAME (desired: ${desired:-unknown})"
+      echo "ttl:    $(_ttl_label "$(_instance_ttl "$id")")"
     fi
     ;;
 
@@ -106,7 +133,7 @@ case "$cmd" in
     # (new public IP). Terraform is not involved — desired_capacity is ignored.
     _guard_region
     _set_desired 1
-    echo "scaling $ASG_NAME to 1; waiting for a running instance..."
+    echo "→ scaled $ASG_NAME to 1" >&2
     "$0" wait
     ;;
 
@@ -115,14 +142,17 @@ case "$cmd" in
     # (The scale-to-zero Lambda also does this automatically on TTL shutdown.)
     _guard_region
     _set_desired 0
-    echo "scaled $ASG_NAME to 0"
+    echo "→ scaled $ASG_NAME to 0 (proxy stopping; no compute cost)" >&2
     ;;
 
   wait)
     # Poll until an instance is running AND Squid is actually serving.
     # Two phases: (1) instance running with a public IP, (2) proxy answers.
     # A running instance still needs ~30-60s for user_data to install Squid,
-    # so "running" alone is not "ready".
+    # so "running" alone is not "ready". Progress goes to stderr so stdout
+    # stays clean for anything capturing the final block.
+    start=$SECONDS
+    echo "· waiting for the ASG to launch an instance..." >&2
     ip=""
     id=""
     for _ in $(seq 1 30); do
@@ -135,6 +165,7 @@ case "$cmd" in
       echo "timed out waiting for a running proxy instance" >&2
       exit 1
     fi
+    echo "· instance $id running ($ip) after $((SECONDS - start))s — waiting for Squid..." >&2
 
     # Phase 2: probe the proxy until Squid is listening. We only need to know
     # Squid answers — any HTTP status (200, or a 407 auth challenge when auth
@@ -144,9 +175,11 @@ case "$cmd" in
       code=$(curl -s -o /dev/null --max-time 5 -w "%{http_code}" \
         --proxy "http://$ip:$PORT" http://example.com 2>/dev/null || true)
       if [[ -n "$code" && "$code" != "000" ]]; then
+        echo "· proxy ready after $((SECONDS - start))s" >&2
         echo "id:    $id"
         echo "ip:    $ip"
         echo "url:   http://$ip:$PORT"
+        echo "ttl:   $(_ttl_label "$(_instance_ttl "$id")")"
         echo "ready: yes (proxy responded HTTP $code)"
         exit 0
       fi
@@ -157,6 +190,7 @@ case "$cmd" in
     echo "id:    $id"
     echo "ip:    $ip"
     echo "url:   http://$ip:$PORT"
+    echo "ttl:   $(_ttl_label "$(_instance_ttl "$id")")"
     echo "ready: no (instance running but proxy not answering yet)" >&2
     exit 1
     ;;
@@ -174,8 +208,9 @@ case "$cmd" in
     # returns before the instance is up, so poll for it rather than reading once.
     _guard_region
     _no_proxy
+    echo "→ applying Terraform (creating ASG + launch template)..." >&2
     tf apply -auto-approve
-    echo "waiting for the ASG to launch a running instance..."
+    echo "→ apply complete; ASG created" >&2
     "$0" wait
     ;;
 
@@ -194,11 +229,14 @@ case "$cmd" in
     _no_proxy
     read -r id _ _ <<< "$(_instance)"
     if [[ -n "$id" && "$id" != "None" ]]; then
+      echo "→ terminating $id..." >&2
       aws ec2 terminate-instances --instance-ids "$id" \
         --profile "$PROFILE" --region "$REGION" > /dev/null
-      echo "terminated $id, waiting for it to go away..."
       aws ec2 wait instance-terminated --instance-ids "$id" \
         --profile "$PROFILE" --region "$REGION"
+      echo "→ $id terminated" >&2
+    else
+      echo "→ no running instance; scaling up a fresh one" >&2
     fi
     "$0" scale-up
     ;;
