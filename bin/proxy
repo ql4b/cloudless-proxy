@@ -5,18 +5,40 @@ set -euo pipefail
 REGION="${AWS_REGION:-eu-central-1}"
 PROFILE="${AWS_PROFILE:-ql4b}"
 PORT="${PROXY_PORT:-8888}"
+# ASG / ownership tag — must match module.this.id (the proxy:managed-by tag value).
+ASG_NAME="${PROXY_ASG_NAME:-cloudless-proxy}"
+MANAGED_BY="${PROXY_MANAGED_BY:-cloudless-proxy}"
 
 _no_proxy() {
   unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 }
 
+# Resolve the current proxy instance LIVE from EC2 by the ownership tag.
+# This is the reliable source in ASG mode: Terraform outputs only reflect the
+# last apply/refresh, whereas the ASG changes the running instance out-of-band.
 _instance() {
   _no_proxy
   aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=cloudless-proxy" \
+    --filters "Name=tag:proxy:managed-by,Values=$MANAGED_BY" \
               "Name=instance-state-name,Values=running,pending" \
     --query "Reservations[0].Instances[0].[InstanceId,PublicIpAddress,State.Name]" \
     --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+}
+
+_asg_desired() {
+  _no_proxy
+  aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG_NAME" \
+    --query "AutoScalingGroups[0].DesiredCapacity" \
+    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+}
+
+_set_desired() {
+  _no_proxy
+  aws autoscaling set-desired-capacity \
+    --auto-scaling-group-name "$ASG_NAME" \
+    --desired-capacity "$1" \
+    --profile "$PROFILE" --region "$REGION"
 }
 
 cmd="${1:-help}"
@@ -24,22 +46,94 @@ cmd="${1:-help}"
 case "$cmd" in
   status)
     read -r id ip state <<< "$(_instance)"
+    desired="$(_asg_desired)"
     if [[ -z "$id" || "$id" == "None" ]]; then
-      echo "no instance running"
+      echo "no instance running (ASG $ASG_NAME desired: ${desired:-unknown})"
     else
-      echo "id:    $id"
-      echo "ip:    $ip"
-      echo "state: $state"
-      echo "url:   http://$ip:$PORT"
+      echo "id:     $id"
+      echo "ip:     $ip"
+      echo "state:  $state"
+      echo "url:    http://$ip:$PORT"
       echo "region: $REGION"
+      echo "asg:    $ASG_NAME (desired: ${desired:-unknown})"
     fi
     ;;
 
+  # --- ASG lifecycle (use_asg mode) ---
+
+  scale-up)
+    # Hand out a proxy: scale the ASG to 1. The ASG launches a fresh instance
+    # (new public IP). Terraform is not involved — desired_capacity is ignored.
+    _set_desired 1
+    echo "scaling $ASG_NAME to 1; waiting for a running instance..."
+    "$0" wait
+    ;;
+
+  scale-down)
+    # Stop paying without destroying the scaffolding: scale the ASG to 0.
+    # (The scale-to-zero Lambda also does this automatically on TTL shutdown.)
+    _set_desired 0
+    echo "scaled $ASG_NAME to 0"
+    ;;
+
+  wait)
+    # Poll until an instance is running AND Squid is actually serving.
+    # Two phases: (1) instance running with a public IP, (2) proxy answers.
+    # A running instance still needs ~30-60s for user_data to install Squid,
+    # so "running" alone is not "ready".
+    ip=""
+    id=""
+    for _ in $(seq 1 30); do
+      read -r id ip state <<< "$(_instance)"
+      [[ -n "$ip" && "$ip" != "None" && "$state" == "running" ]] && break
+      ip=""
+      sleep 5
+    done
+    if [[ -z "$ip" ]]; then
+      echo "timed out waiting for a running proxy instance" >&2
+      exit 1
+    fi
+
+    # Phase 2: probe the proxy until Squid is listening. We only need to know
+    # Squid answers — any HTTP status (200, or a 407 auth challenge when auth
+    # is enabled) means it's up. Use an HTTP target so we exercise Squid's
+    # forward path without depending on CONNECT tunnelling or the target's TLS.
+    for _ in $(seq 1 24); do
+      code=$(curl -s -o /dev/null --max-time 5 -w "%{http_code}" \
+        --proxy "http://$ip:$PORT" http://example.com 2>/dev/null || true)
+      if [[ -n "$code" && "$code" != "000" ]]; then
+        echo "id:    $id"
+        echo "ip:    $ip"
+        echo "url:   http://$ip:$PORT"
+        echo "ready: yes (proxy responded HTTP $code)"
+        exit 0
+      fi
+      sleep 5
+    done
+
+    # Instance is up but the proxy never answered within the window.
+    echo "id:    $id"
+    echo "ip:    $ip"
+    echo "url:   http://$ip:$PORT"
+    echo "ready: no (instance running but proxy not answering yet)" >&2
+    exit 1
+    ;;
+
+  url)
+    # Print the live proxy URL (empty/exit 1 if none running). Reliable in ASG
+    # mode; prefer this over 'tf output proxy_url'.
+    read -r _ ip _ <<< "$(_instance)"
+    [[ -z "$ip" || "$ip" == "None" ]] && { echo "no instance running" >&2; exit 1; }
+    echo "http://$ip:$PORT"
+    ;;
+
   up)
+    # Create the ASG scaffolding. With wait_for_capacity_timeout=0 the apply
+    # returns before the instance is up, so poll for it rather than reading once.
     _no_proxy
     tf apply -auto-approve
-    read -r id ip state <<< "$(_instance)"
-    echo "HTTP_PROXY=http://$ip:$PORT"
+    echo "waiting for the ASG to launch a running instance..."
+    "$0" wait
     ;;
 
   down)
@@ -48,18 +142,19 @@ case "$cmd" in
     ;;
 
   recreate)
+    # In ASG mode, "recreate" = terminate the current instance and let the
+    # scale-to-zero + scale-up cycle hand out a fresh one (new IP). The Lambda
+    # drives desired to 0 on termination, so we scale back to 1 afterward.
     _no_proxy
     read -r id _ _ <<< "$(_instance)"
     if [[ -n "$id" && "$id" != "None" ]]; then
       aws ec2 terminate-instances --instance-ids "$id" \
         --profile "$PROFILE" --region "$REGION" > /dev/null
-      echo "terminated $id, waiting..."
+      echo "terminated $id, waiting for it to go away..."
       aws ec2 wait instance-terminated --instance-ids "$id" \
         --profile "$PROFILE" --region "$REGION"
     fi
-    tf apply -auto-approve
-    read -r id ip state <<< "$(_instance)"
-    echo "HTTP_PROXY=http://$ip:$PORT"
+    "$0" scale-up
     ;;
 
   test)
@@ -79,7 +174,21 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: proxy <status|up|down|recreate|test|env>"
-    echo "       eval \$(proxy env)   # export proxy vars"
+    echo "usage: proxy <status|scale-up|scale-down|wait|url|up|down|recreate|test|env>"
+    echo
+    echo "  ASG mode (use_asg=true):"
+    echo "    scale-up    scale ASG to 1 and wait for a fresh proxy (new IP)"
+    echo "    scale-down  scale ASG to 0 (stop cost; keeps scaffolding)"
+    echo "    url         print the live proxy URL (reliable; prefer over tf output)"
+    echo "    recreate    terminate current instance, then scale back up"
+    echo "    wait        poll until a running instance has a public IP"
+    echo
+    echo "  provisioning:"
+    echo "    up          terraform apply (create/update ASG + Lambda scaffolding)"
+    echo "    down        terraform destroy"
+    echo
+    echo "    status      show current instance + ASG desired"
+    echo "    test        curl through the proxy"
+    echo "    env         eval \$(proxy env)   # export proxy vars"
     ;;
 esac

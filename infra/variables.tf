@@ -24,11 +24,6 @@ variable "allowed_cidrs" {
   default = []
 }
 
-variable "spot" {
-  type    = bool
-  default = true
-}
-
 variable "instance_type" {
   type    = string
   default = "t4g.nano"
