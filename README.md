@@ -26,12 +26,21 @@ curl http://httpbin.org/ip   # shows the proxy's IP
 
 | Command | Description |
 |---------|-------------|
-| `proxy up` | Provision the proxy instance |
-| `proxy down` | Destroy the instance |
-| `proxy recreate` | Terminate + reprovision for a fresh IP |
-| `proxy status` | Show instance state, IP, and proxy URL |
+| `proxy up` | Provision the ASG scaffolding and wait until the proxy is serving |
+| `proxy down` | Destroy everything |
+| `proxy scale-up` | Scale the ASG to 1 — hand out a fresh proxy (new IP), wait until ready |
+| `proxy scale-down` | Scale the ASG to 0 — stop cost, keep the scaffolding |
+| `proxy recreate` | Terminate current instance + scale back up for a fresh IP |
+| `proxy status` | Show instance state, IP, URL, and ASG desired capacity |
+| `proxy url` | Print the live proxy URL |
 | `proxy test` | Verify the proxy is responding |
 | `proxy env` | Print proxy environment variables for export |
+
+> In the underlying module's v3 (ASG) design, `up`/`scale-up`/`recreate` return
+> only once Squid is actually serving (they poll the proxy), so the URL they
+> print is immediately usable. With `TF_VAR_ttl_hours` set, the instance
+> self-terminates after the TTL and the ASG scales itself to zero;
+> `proxy scale-up` hands out a fresh one on demand without a `terraform apply`.
 
 ### Typical workflow
 
@@ -69,24 +78,59 @@ TERRAFORM_BIN="/usr/local/bin/terraform-$TERRAFORM_VERSION"
 Set these in `.env` or pass at runtime:
 
 ```bash
-TF_VAR_spot=false            # use on-demand instead of spot
-TF_VAR_ttl_hours=2           # auto-terminate after 2 hours
+TF_VAR_ttl_hours=2           # disposable mode: auto-terminate after 2h + scale-to-zero
 TF_VAR_instance_type=t4g.micro  # larger instance if needed
 TF_VAR_allowed_cidrs='["203.0.113.0/24"]'  # explicit CIDRs (default: auto-detect your IP)
 TF_VAR_vpc_id=vpc-abc123     # deploy into a specific VPC (default: region's default VPC)
 TF_VAR_subnet_id=subnet-def456  # deploy into a specific public subnet
 ```
 
+> **Note:** `spot` was removed in the underlying module's v3 (ASG) redesign —
+> the proxy is on-demand only. Setting `TF_VAR_spot` now has no effect.
+
 ## Region Switching
 
-The proxy is stateless -- switching region means a full redeploy:
+This wrapper manages **one proxy at a time**, and switching region is a full
+teardown-and-redeploy — you cannot move a running proxy between regions.
+
+Two things make this a hard rule rather than a suggestion:
+
+- **Single local state.** There is one `infra/terraform.tfstate`, shared across
+  regions. It records the region each resource lives in.
+- **The AWS provider pins resources to their creation region.** If you change
+  `AWS_REGION` and re-apply *without destroying first*, Terraform keeps the old
+  region's resources pinned in state and would create new ones in the target
+  region — stranding the old resources (still billable) and splitting state
+  across two regions.
+
+To protect against that, `proxy up`/`scale-up`/`scale-down`/`recreate` **refuse
+to run** when the region in state differs from `AWS_REGION`, and print the
+migration steps. (`proxy down` is *not* guarded — it must be able to destroy the
+deployed region, which is step one of a migration.)
+
+Correct migration sequence:
 
 ```bash
-# edit AWS_REGION in .env, then:
+# 1. Make sure AWS_REGION still points at the CURRENTLY DEPLOYED region.
+proxy down                     # destroy in the old region
+
+# 2. Edit AWS_REGION in .env to the new region, then reload:
 source activate
-proxy down    # destroy in old region
-proxy up      # provision in new region
+
+# 3. Deploy in the new region:
+proxy up
 ```
+
+If you try to skip the teardown, you'll see:
+
+```
+ERROR: region mismatch.
+  Terraform state holds resources in: us-west-1
+  AWS_REGION is currently set to:      eu-west-1
+  ...
+```
+
+which walks you through the same steps.
 
 ## How It Works
 
@@ -106,16 +150,18 @@ cloudless-proxy/
 
 ## What You Get
 
-- EC2 spot instance (`t4g.nano` ARM64, Amazon Linux 2023)
+- EC2 on-demand instance (`t4g.nano` ARM64, Amazon Linux 2023) in a single-node Auto Scaling Group
 - Squid HTTP proxy on port 8888
 - Security group locked to your IP (auto-detected)
 - IMDSv2 enforced, encrypted EBS, no SSH
 - SSM access for debugging (`aws ssm start-session`)
-- Optional TTL auto-termination
+- Optional TTL auto-termination with scale-to-zero (no drift)
 
 ## Cost
 
-~$0.0016/hour for `t4g.nano` spot in `us-east-1`. Typical usage (deploy for an hour, destroy) costs less than a cent.
+~$0.0042/hour for an on-demand `t4g.nano` in `us-east-1`. Scale to zero (or set
+`TF_VAR_ttl_hours`) to drop compute cost to zero between uses. Typical usage
+(deploy for an hour, then scale down or destroy) costs about a cent.
 
 ## Shell Integration
 
