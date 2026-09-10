@@ -41,6 +41,46 @@ _set_desired() {
     --profile "$PROFILE" --region "$REGION"
 }
 
+# Region recorded in Terraform state (empty if no state / no resources yet).
+# AWS provider v6 pins each resource to the region it was created in, so a
+# region switch via AWS_REGION would strand the old region's resources and
+# split state across two regions. We read the state's region to guard against
+# that (model: one proxy at a time — migrate by destroying first).
+# bin/proxy lives in <repo>/bin, so the repo root is one level up.
+_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+_STATE="$_ROOT/infra/terraform.tfstate"
+
+_state_region() {
+  [[ -f "$_STATE" ]] || return 0
+  grep -oE '"region": "[a-z0-9-]+"' "$_STATE" 2>/dev/null \
+    | head -1 | sed -E 's/.*"([a-z0-9-]+)"$/\1/'
+}
+
+# Refuse region-mismatched mutations. If state holds resources in a different
+# region than the one we're pointed at, block and tell the user to migrate.
+_guard_region() {
+  local sr
+  sr="$(_state_region)"
+  if [[ -n "$sr" && "$sr" != "$REGION" ]]; then
+    cat >&2 <<MSG
+ERROR: region mismatch.
+  Terraform state holds resources in: $sr
+  AWS_REGION is currently set to:      $REGION
+
+This wrapper manages one proxy at a time. Switching region without
+destroying first would strand the $sr resources and split state across
+two regions.
+
+To migrate:
+  1. set AWS_REGION=$sr   (back to the deployed region)
+  2. ./bin/proxy down     (destroy in $sr)
+  3. set AWS_REGION=$REGION
+  4. ./bin/proxy up       (deploy in $REGION)
+MSG
+    exit 1
+  fi
+}
+
 cmd="${1:-help}"
 
 case "$cmd" in
@@ -59,11 +99,12 @@ case "$cmd" in
     fi
     ;;
 
-  # --- ASG lifecycle (use_asg mode) ---
+  # --- ASG lifecycle ---
 
   scale-up)
     # Hand out a proxy: scale the ASG to 1. The ASG launches a fresh instance
     # (new public IP). Terraform is not involved — desired_capacity is ignored.
+    _guard_region
     _set_desired 1
     echo "scaling $ASG_NAME to 1; waiting for a running instance..."
     "$0" wait
@@ -72,6 +113,7 @@ case "$cmd" in
   scale-down)
     # Stop paying without destroying the scaffolding: scale the ASG to 0.
     # (The scale-to-zero Lambda also does this automatically on TTL shutdown.)
+    _guard_region
     _set_desired 0
     echo "scaled $ASG_NAME to 0"
     ;;
@@ -130,6 +172,7 @@ case "$cmd" in
   up)
     # Create the ASG scaffolding. With wait_for_capacity_timeout=0 the apply
     # returns before the instance is up, so poll for it rather than reading once.
+    _guard_region
     _no_proxy
     tf apply -auto-approve
     echo "waiting for the ASG to launch a running instance..."
@@ -137,14 +180,17 @@ case "$cmd" in
     ;;
 
   down)
+    # Not region-guarded: destroy must be able to tear down the deployed
+    # region (it is the first step of a migration).
     _no_proxy
     tf destroy -auto-approve
     ;;
 
   recreate)
-    # In ASG mode, "recreate" = terminate the current instance and let the
-    # scale-to-zero + scale-up cycle hand out a fresh one (new IP). The Lambda
-    # drives desired to 0 on termination, so we scale back to 1 afterward.
+    # "recreate" = terminate the current instance and let the scale-to-zero +
+    # scale-up cycle hand out a fresh one (new IP). The Lambda drives desired
+    # to 0 on termination, so we scale back to 1 afterward.
+    _guard_region
     _no_proxy
     read -r id _ _ <<< "$(_instance)"
     if [[ -n "$id" && "$id" != "None" ]]; then
