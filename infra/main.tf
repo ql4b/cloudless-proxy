@@ -7,9 +7,8 @@ module "label" {
 }
 
 module "proxy" {
-  # Tracking the module's feature branch (v3 ASG redesign) for validation.
-  # Switch to the registry source (ql4b/ec2-proxy/aws, version ~> 3.0) once released.
-  source = "github.com/ql4b/terraform-aws-ec2-proxy?ref=feat/autoscaling-group"
+  source  = "ql4b/ec2-proxy/aws"
+  version = "~> 3.0"
 
   context       = module.label.context
   allowed_cidrs = var.allowed_cidrs
