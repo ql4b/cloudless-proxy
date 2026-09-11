@@ -165,58 +165,37 @@ cloudless-proxy/
 
 ## Shell Integration
 
-Add these to your `~/.zshrc` (or `~/.bashrc`) to use the proxy from any directory without needing to `cd` or `source activate` manually:
+Source the version-controlled `shell-integration.zsh` from your `~/.zshrc` (or
+`~/.bashrc`) to drive the proxy from any directory without `cd`-ing into the
+repo or running `source activate` by hand:
 
 ```bash
-CLOUDLESS_PROXY_PATH="$HOME/code/cloudless-proxy"  # adjust to your clone path
-
-proxy_up() {
-  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy up)
-}
-
-proxy_down() {
-  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy down)
-}
-
-proxy_recreate() {
-  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy recreate)
-}
-
-proxy_status() {
-  (cd "$CLOUDLESS_PROXY_PATH" && source ./activate && proxy status)
-}
-
-proxy_env() {
-  cd "$CLOUDLESS_PROXY_PATH" && source ./activate && eval "$(proxy env)" && cd "$OLDPWD"
-}
+CLOUDLESS_PROXY_PATH="$HOME/code/ql4b/cloudless/cloudless-proxy"  # your clone path
+source "$CLOUDLESS_PROXY_PATH/shell-integration.zsh"
 ```
+
+That defines: `proxy_up`, `proxy_down`, `proxy_scale_up`, `proxy_scale_down`,
+`proxy_recreate`, `proxy_status`, `proxy_url`, `proxy_test`, `proxy_env`,
+`cloudless_proxy` (drop into the activated repo), and `proxy_mitm` /
+`proxy_mitm_browser`. Action commands run in a subshell (no `PATH` pollution,
+no leftover cwd); `proxy_env` exports `HTTP_PROXY` et al into your current shell.
 
 Then from any terminal:
 
 ```bash
-proxy_up                  # deploy
+proxy_up                  # deploy + wait until serving
 proxy_env                 # export HTTP_PROXY into current shell
 curl http://httpbin.org/ip
-proxy_down                # destroy
+proxy_scale_down          # park at $0 (keeps the scaffolding)
+# ... later ...
+proxy_scale_up            # fresh IP, back in ~a minute
+proxy_down                # tear everything down
 ```
 
 ### MITM inspection
 
-Chain with [mitmproxy](https://mitmproxy.org/) to inspect HTTPS traffic through the cloud proxy:
-
-```bash
-proxy_mitm() {
-  local port="${1:-8080}"
-  shift 2>/dev/null
-  proxy_env
-  mitmproxy \
-      --mode upstream:$HTTP_PROXY \
-      --listen-host 127.0.0.1 \
-      --listen-port "$port" \
-      --ssl-insecure \
-      "$@"
-}
-```
+`shell-integration.zsh` also defines `proxy_mitm`, which chains the cloud proxy
+with [mitmproxy](https://mitmproxy.org/) to inspect HTTPS traffic:
 
 ```bash
 proxy_up
