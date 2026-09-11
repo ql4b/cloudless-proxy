@@ -18,32 +18,44 @@ _no_proxy() {
   unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 }
 
+# Single entry point for every AWS CLI call. Centralizes the things that
+# otherwise cause the intermittent hang and helper inconsistency:
+#   - _no_proxy runs in the SAME process as the aws call, so the unset actually
+#     applies. (Previously _no_proxy ran inside $(...) command substitution, so
+#     the unset died with the subshell and the parent still had HTTP_PROXY set —
+#     which is why `status` hung on the one helper that made an aws call outside
+#     a subshell context routed through an unreachable proxy.)
+#   - connect/read timeouts so a stalled endpoint or dead proxy can't hang,
+#   - inherits AWS_PAGER="" (set at top) so output is never piped to a pager,
+#   - uniform --profile/--region.
+_aws() {
+  _no_proxy
+  aws --cli-connect-timeout 5 --cli-read-timeout 10 \
+    --profile "$PROFILE" --region "$REGION" "$@"
+}
+
 # Resolve the current proxy instance LIVE from EC2 by the ownership tag.
 # This is the reliable source in ASG mode: Terraform outputs only reflect the
 # last apply/refresh, whereas the ASG changes the running instance out-of-band.
 _instance() {
-  _no_proxy
-  aws ec2 describe-instances \
+  _aws ec2 describe-instances \
     --filters "Name=tag:proxy:managed-by,Values=$MANAGED_BY" \
               "Name=instance-state-name,Values=running,pending" \
     --query "Reservations[0].Instances[0].[InstanceId,PublicIpAddress,State.Name]" \
-    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+    --output text 2>/dev/null
 }
 
 _asg_desired() {
-  _no_proxy
-  aws autoscaling describe-auto-scaling-groups \
+  _aws autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG_NAME" \
     --query "AutoScalingGroups[0].DesiredCapacity" \
-    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+    --output text 2>/dev/null
 }
 
 _set_desired() {
-  _no_proxy
-  aws autoscaling set-desired-capacity \
+  _aws autoscaling set-desired-capacity \
     --auto-scaling-group-name "$ASG_NAME" \
-    --desired-capacity "$1" \
-    --profile "$PROFILE" --region "$REGION"
+    --desired-capacity "$1"
 }
 
 # Read the proxy:ttl-hours tag off an instance (empty if unset / always-on).
@@ -51,9 +63,9 @@ _set_desired() {
 _instance_ttl() {
   local id="$1"
   [[ -z "$id" || "$id" == "None" ]] && return 0
-  aws ec2 describe-instances --instance-ids "$id" \
+  _aws ec2 describe-instances --instance-ids "$id" \
     --query "Reservations[0].Instances[0].Tags[?Key=='proxy:ttl-hours'].Value | [0]" \
-    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null
+    --output text 2>/dev/null
 }
 
 # Human-readable TTL line: "2h (self-terminates)" or "none (always-on)".
